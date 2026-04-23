@@ -8,7 +8,6 @@ on:
 
 env:
   PACKAGE_NAME: luci-app-xray
-  CACHE_DIR: $HOME/cache
 
 jobs:
   release:
@@ -25,7 +24,6 @@ jobs:
     env:
       SDK_URL_PATH: ${{ matrix.sdk_url_path }}
       SDK_FILE_GLOB: ${{ matrix.sdk_file_glob }}
-      CCACHE_DIR: ${{ github.workspace }}/.ccache
       CONFIG_CCACHE: y
 
     steps:
@@ -36,6 +34,26 @@ jobs:
         id: cache_key
         shell: bash
         run: echo "timestamp=$(date +'%s')" >> "$GITHUB_OUTPUT"
+
+      - name: Init Paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CACHE_DIR="${HOME}/cache"
+          CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+
+          mkdir -p "$CACHE_DIR/sdk" "$CACHE_DIR/dl" "$CACHE_DIR/feeds" "$CCACHE_DIR"
+
+          echo "CACHE_DIR=$CACHE_DIR" >> "$GITHUB_ENV"
+          echo "CACHE_DIR_SDK=$CACHE_DIR/sdk" >> "$GITHUB_ENV"
+          echo "CACHE_DIR_DL=$CACHE_DIR/dl" >> "$GITHUB_ENV"
+          echo "CACHE_DIR_FEEDS=$CACHE_DIR/feeds" >> "$GITHUB_ENV"
+          echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+          echo "SDK_HOME=$(mktemp -d)" >> "$GITHUB_ENV"
+
+          echo "Using CACHE_DIR=$CACHE_DIR"
+          echo "Using CCACHE_DIR=$CCACHE_DIR"
 
       - name: Setup Cache
         uses: actions/cache@v4
@@ -56,22 +74,6 @@ jobs:
             build-essential clang flex bison g++ gawk gcc-multilib gettext \
             git libncurses5-dev libssl-dev python3 python3-setuptools rsync \
             unzip zlib1g-dev file wget xsltproc p7zip-full ccache tar
-
-      - name: Create Directories
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$CACHE_DIR/sdk" "$CACHE_DIR/dl" "$CACHE_DIR/feeds"
-
-          echo "CACHE_DIR=$CACHE_DIR" >> "$GITHUB_ENV"
-          echo "CACHE_DIR_SDK=$CACHE_DIR/sdk" >> "$GITHUB_ENV"
-          echo "CACHE_DIR_DL=$CACHE_DIR/dl" >> "$GITHUB_ENV"
-          echo "CACHE_DIR_FEEDS=$CACHE_DIR/feeds" >> "$GITHUB_ENV"
-          echo "SDK_HOME=$(mktemp -d)" >> "$GITHUB_ENV"
-
-          echo "Using CACHE_DIR=$CACHE_DIR"
-          ls -lah "$CACHE_DIR"
 
       - name: Download and Unpack SDK
         shell: bash
@@ -122,6 +124,7 @@ jobs:
           fi
 
           sha256sum -c sha256sums.small
+          ls -lah "$CACHE_DIR_SDK"
           file "$CACHE_DIR_SDK/$SDK_FILE"
 
           rm -rf "$SDK_HOME"/*
