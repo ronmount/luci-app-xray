@@ -8,7 +8,7 @@ on:
 
 env:
   PACKAGE_NAME: luci-app-xray
-  CACHE_DIR: ~/cache
+  CACHE_DIR: $HOME/cache
 
 jobs:
   release:
@@ -25,7 +25,7 @@ jobs:
     env:
       SDK_URL_PATH: ${{ matrix.sdk_url_path }}
       SDK_FILE_GLOB: ${{ matrix.sdk_file_glob }}
-      CCACHE_DIR: ~/.ccache
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
       CONFIG_CCACHE: y
 
     steps:
@@ -34,6 +34,7 @@ jobs:
 
       - name: Prepare Cache Key
         id: cache_key
+        shell: bash
         run: echo "timestamp=$(date +'%s')" >> "$GITHUB_OUTPUT"
 
       - name: Setup Cache
@@ -47,43 +48,83 @@ jobs:
             openwrt-${{ matrix.arch }}-${{ env.PACKAGE_NAME }}-
 
       - name: Install Dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
             build-essential clang flex bison g++ gawk gcc-multilib gettext \
             git libncurses5-dev libssl-dev python3 python3-setuptools rsync \
-            unzip zlib1g-dev file wget xsltproc p7zip-full ccache
+            unzip zlib1g-dev file wget xsltproc p7zip-full ccache tar
 
       - name: Create Directories
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p "$CACHE_DIR/sdk" "$CACHE_DIR/dl" "$CACHE_DIR/feeds"
+
+          echo "CACHE_DIR=$CACHE_DIR" >> "$GITHUB_ENV"
           echo "CACHE_DIR_SDK=$CACHE_DIR/sdk" >> "$GITHUB_ENV"
           echo "CACHE_DIR_DL=$CACHE_DIR/dl" >> "$GITHUB_ENV"
           echo "CACHE_DIR_FEEDS=$CACHE_DIR/feeds" >> "$GITHUB_ENV"
           echo "SDK_HOME=$(mktemp -d)" >> "$GITHUB_ENV"
+
+          echo "Using CACHE_DIR=$CACHE_DIR"
+          ls -lah "$CACHE_DIR"
 
       - name: Download and Unpack SDK
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "CACHE_DIR_SDK=$CACHE_DIR_SDK"
+          echo "SDK_URL_PATH=$SDK_URL_PATH"
+          echo "SDK_FILE_GLOB=$SDK_FILE_GLOB"
+          echo "SDK_HOME=$SDK_HOME"
+
+          mkdir -p "$CACHE_DIR_SDK"
           cd "$CACHE_DIR_SDK"
+
           wget -q -O sha256sums "$SDK_URL_PATH/sha256sums"
 
-          SDK_FILE="$(grep -E "${SDK_FILE_GLOB//./\\.}" sha256sums | awk '{print $2}' | sed 's/*//g' | head -n1)"
+          SDK_FILE="$(
+            awk '{print $2}' sha256sums \
+              | sed 's/^\*//' \
+              | while read -r f; do
+                  case "$f" in
+                    $SDK_FILE_GLOB)
+                      echo "$f"
+                      break
+                      ;;
+                  esac
+                done
+          )"
+
           if [ -z "$SDK_FILE" ]; then
             echo "::error::Cannot find SDK file by glob: $SDK_FILE_GLOB"
+            echo "Available files in sha256sums:"
+            awk '{print $2}' sha256sums | sed 's/^\*//'
             exit 1
           fi
 
-          grep " $SDK_FILE$" sha256sums > sha256sums.small
+          echo "Selected SDK_FILE=$SDK_FILE"
 
-          if ! sha256sum -c sha256sums.small >/dev/null 2>&1; then
-            wget -q -O "$SDK_FILE" "$SDK_URL_PATH/$SDK_FILE"
-            sha256sum -c sha256sums.small
+          awk -v file="$SDK_FILE" '$2 == "*"file || $2 == file {print}' sha256sums > sha256sums.small
+
+          if [ ! -s sha256sums.small ]; then
+            echo "::error::Failed to extract checksum for $SDK_FILE"
+            exit 1
           fi
 
+          if [ ! -f "$SDK_FILE" ] || ! sha256sum -c sha256sums.small >/dev/null 2>&1; then
+            wget -q -O "$SDK_FILE" "$SDK_URL_PATH/$SDK_FILE"
+          fi
+
+          sha256sum -c sha256sums.small
           file "$CACHE_DIR_SDK/$SDK_FILE"
+
+          rm -rf "$SDK_HOME"/*
           7z x "$CACHE_DIR_SDK/$SDK_FILE" -so | tar -C "$SDK_HOME" -xf - --strip=1
 
           cd "$SDK_HOME"
@@ -96,6 +137,9 @@ jobs:
           sed -i 's#git.openwrt.org/feed/packages#github.com/openwrt/packages#' feeds.conf
           sed -i 's#git.openwrt.org/project/luci#github.com/openwrt/luci#' feeds.conf
           sed -i 's#git.openwrt.org/feed/telephony#github.com/openwrt/telephony#' feeds.conf
+
+          echo "SDK unpacked successfully"
+          ls -lah "$SDK_HOME"
 
       - name: Update and Install Feeds
         shell: bash
@@ -126,6 +170,12 @@ jobs:
           set -euo pipefail
 
           find "$SDK_HOME/bin/" -type f -name "${PACKAGE_NAME}*.apk" -exec cp {} "${{ github.workspace }}" \;
+
+          if ! find "${{ github.workspace }}" -type f -name "*.apk" | grep -q .; then
+            echo "::error::No .apk files found after build"
+            exit 1
+          fi
+
           find "${{ github.workspace }}" -type f -name "*.apk" -exec ls -lh {} \;
 
       - name: Release and Upload Assets
@@ -144,14 +194,17 @@ jobs:
     needs: release
     steps:
       - name: Notify Jenkins
+        shell: bash
         run: |
-          if [ -z "$TRIGGER_URL" ] ; then
+          set -euo pipefail
+
+          if [ -z "${TRIGGER_URL:-}" ] ; then
             echo "::warning::No trigger url found, skip..."
             exit 0
           fi
 
           curl -X POST \
-              -H "Content-Type: application/json; charset=utf-8" \
-              -H "Authorization: Bearer $TRIGGER_TOKEN" \
-              -d "{\"event\":\"release\",\"repository\":\"${{ github.repository }}\",\"ref\":\"${{ github.ref }}\"}" \
-              "$TRIGGER_URL" || true
+            -H "Content-Type: application/json; charset=utf-8" \
+            -H "Authorization: Bearer $TRIGGER_TOKEN" \
+            -d "{\"event\":\"release\",\"repository\":\"${{ github.repository }}\",\"ref\":\"${{ github.ref }}\"}" \
+            "$TRIGGER_URL" || true
