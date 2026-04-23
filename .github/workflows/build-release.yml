@@ -7,7 +7,12 @@ on:
   workflow_dispatch:
 
 env:
-  PACKAGE_NAME: luci-app-xray
+  CORE_PKG_NAME: luci-app-xray
+  STATUS_PKG_NAME: luci-app-xray-status
+  CORE_SOURCE_SUBDIR: core
+  STATUS_SOURCE_SUBDIR: status
+  CORE_BUILD_DIR: package/custom/luci-app-xray
+  STATUS_BUILD_DIR: package/custom/luci-app-xray-status
 
 jobs:
   release:
@@ -52,18 +57,15 @@ jobs:
           echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
           echo "SDK_HOME=$(mktemp -d)" >> "$GITHUB_ENV"
 
-          echo "Using CACHE_DIR=$CACHE_DIR"
-          echo "Using CCACHE_DIR=$CCACHE_DIR"
-
       - name: Setup Cache
         uses: actions/cache@v4
         with:
           path: |
             ${{ env.CACHE_DIR }}
             ${{ env.CCACHE_DIR }}
-          key: openwrt-${{ matrix.arch }}-${{ env.PACKAGE_NAME }}-${{ steps.cache_key.outputs.timestamp }}
+          key: openwrt-${{ matrix.arch }}-${{ steps.cache_key.outputs.timestamp }}
           restore-keys: |
-            openwrt-${{ matrix.arch }}-${{ env.PACKAGE_NAME }}-
+            openwrt-${{ matrix.arch }}-
 
       - name: Install Dependencies
         shell: bash
@@ -79,11 +81,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "CACHE_DIR_SDK=$CACHE_DIR_SDK"
-          echo "SDK_URL_PATH=$SDK_URL_PATH"
-          echo "SDK_FILE_GLOB=$SDK_FILE_GLOB"
-          echo "SDK_HOME=$SDK_HOME"
 
           mkdir -p "$CACHE_DIR_SDK"
           cd "$CACHE_DIR_SDK"
@@ -105,29 +102,17 @@ jobs:
 
           if [ -z "$SDK_FILE" ]; then
             echo "::error::Cannot find SDK file by glob: $SDK_FILE_GLOB"
-            echo "Available files in sha256sums:"
             awk '{print $2}' sha256sums | sed 's/^\*//'
             exit 1
           fi
 
-          echo "Selected SDK_FILE=$SDK_FILE"
-
           awk -v file="$SDK_FILE" '$2 == "*"file || $2 == file {print}' sha256sums > sha256sums.small
-
-          if [ ! -s sha256sums.small ]; then
-            echo "::error::Failed to extract checksum for $SDK_FILE"
-            exit 1
-          fi
 
           if [ ! -f "$SDK_FILE" ] || ! sha256sum -c sha256sums.small >/dev/null 2>&1; then
             wget -q -O "$SDK_FILE" "$SDK_URL_PATH/$SDK_FILE"
           fi
 
           sha256sum -c sha256sums.small
-          ls -lah "$CACHE_DIR_SDK"
-          file "$CACHE_DIR_SDK/$SDK_FILE"
-
-          rm -rf "$SDK_HOME"/*
           tar --zstd -C "$SDK_HOME" -xf "$CACHE_DIR_SDK/$SDK_FILE" --strip=1
 
           cd "$SDK_HOME"
@@ -141,50 +126,108 @@ jobs:
           sed -i 's#git.openwrt.org/project/luci#github.com/openwrt/luci#' feeds.conf
           sed -i 's#git.openwrt.org/feed/telephony#github.com/openwrt/telephony#' feeds.conf
 
-          echo "SDK unpacked successfully"
-          ls -lah "$SDK_HOME"
-
-      - name: Update and Install Feeds
+      - name: Update feeds
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$SDK_HOME"
           ./scripts/feeds update -a
-          ln -s "${{ github.workspace }}" "package/$PACKAGE_NAME"
-          ./scripts/feeds install -a
 
-      - name: Build Package
+      - name: Install only required feed packages
         shell: bash
         run: |
           set -euo pipefail
-
           cd "$SDK_HOME"
-          make defconfig
-          make package/${PACKAGE_NAME}/clean V=s
-          make package/${PACKAGE_NAME}/compile V=s
+
+          ./scripts/feeds install luci-base
+          ./scripts/feeds install firewall4
+          ./scripts/feeds install dnsmasq
+          ./scripts/feeds install ca-bundle
+          ./scripts/feeds install wget || true
+          ./scripts/feeds install xray-core || true
+
+      - name: Place custom packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SDK_HOME"
+
+          mkdir -p "$(dirname "$CORE_BUILD_DIR")"
+
+          ln -s "${GITHUB_WORKSPACE}/${CORE_SOURCE_SUBDIR}" "$CORE_BUILD_DIR"
+          ln -s "${GITHUB_WORKSPACE}/${STATUS_SOURCE_SUBDIR}" "$STATUS_BUILD_DIR"
+
+          test -f "$CORE_BUILD_DIR/Makefile"
+          test -f "$STATUS_BUILD_DIR/Makefile"
+
+          echo "Core package:"
+          ls -lah "$CORE_BUILD_DIR"
+          echo "Status package:"
+          ls -lah "$STATUS_BUILD_DIR"
+
+      - name: Prepare minimal config
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SDK_HOME"
+
+          cat > .config <<'EOF'
+          CONFIG_ALL_NONSHARED=n
+          CONFIG_ALL_KMODS=n
+          CONFIG_ALL=n
+          CONFIG_AUTOREMOVE=y
+          CONFIG_PACKAGE_luci-app-xray=m
+          CONFIG_PACKAGE_luci-app-xray-status=m
+          EOF
+
+          make oldconfig </dev/null
+
+      - name: Build packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SDK_HOME"
+
+          make package/custom/luci-app-xray/clean V=s
+          make package/custom/luci-app-xray/compile V=s
+
+          make package/custom/luci-app-xray-status/clean V=s
+          make package/custom/luci-app-xray-status/compile V=s
 
           echo "Built packages:"
-          find "$SDK_HOME/bin/" -type f \( -name "*.apk" -o -name "*.ipk" \) -exec ls -lh {} \;
+          find "$SDK_HOME/bin/" -type f \( -name "*.apk" -o -name "*.ipk" \) | sort
 
-      - name: Copy Built Packages
+      - name: Copy built packages
         shell: bash
         run: |
           set -euo pipefail
 
-          find "$SDK_HOME/bin/" -type f -name "${PACKAGE_NAME}*.apk" -exec cp {} "${{ github.workspace }}" \;
+          find "$SDK_HOME/bin/" -type f \( \
+            -name "luci-app-xray*.apk" -o \
+            -name "luci-app-xray-status*.apk" \
+          \) -exec cp {} "$GITHUB_WORKSPACE" \;
 
-          if ! find "${{ github.workspace }}" -type f -name "*.apk" | grep -q .; then
-            echo "::error::No .apk files found after build"
+          COUNT="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \( \
+            -name "luci-app-xray*.apk" -o \
+            -name "luci-app-xray-status*.apk" \
+          \) | wc -l)"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No expected .apk files found after build"
+            find "$SDK_HOME/bin/" -type f | sort
             exit 1
           fi
 
-          find "${{ github.workspace }}" -type f -name "*.apk" -exec ls -lh {} \;
+          find "$GITHUB_WORKSPACE" -maxdepth 1 -type f \( \
+            -name "luci-app-xray*.apk" -o \
+            -name "luci-app-xray-status*.apk" \
+          \) -exec ls -lh {} \;
 
       - name: Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: "*.apk"
+          files: |
+            *.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
